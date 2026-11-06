@@ -46,6 +46,14 @@ initialize_database()
 
 
 def get_secret():
+    configured_secret = os.getenv("AUTH_SECRET_KEY", "").strip()
+
+    if configured_secret:
+        secret = configured_secret.encode("utf-8")
+        if len(secret) < 32:
+            raise RuntimeError("AUTH_SECRET_KEY must be at least 32 characters.")
+        return secret
+
     if SECRET_PATH.exists():
         return SECRET_PATH.read_bytes()
 

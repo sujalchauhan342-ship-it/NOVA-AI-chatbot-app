@@ -1162,9 +1162,6 @@ def chunk_document(document_id: str):
 # EMBEDDINGS AND CHROMADB
 # --------------------------------------------------
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
 CHROMA_DIR = Path(__file__).resolve().parent / "chroma_db"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -1180,9 +1177,11 @@ def get_embedding_resources():
 
     if _embedding_model is None:
         print("Loading embedding model...")
+        from sentence_transformers import SentenceTransformer
         _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
     if _chroma_client is None:
+        import chromadb
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
         _chroma_client = chromadb.PersistentClient(

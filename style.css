@@ -1,0 +1,17 @@
+﻿
+/* Open chat options upward */
+.history-menu {
+    position: absolute !important;
+    top: auto !important;
+    bottom: 35px !important;
+    right: 0 !important;
+    transform: none !important;
+    z-index: 99999 !important;
+    display: flex;
+    flex-direction: column !important;
+}
+
+.history-menu[hidden] {
+    display: none !important;
+}
+

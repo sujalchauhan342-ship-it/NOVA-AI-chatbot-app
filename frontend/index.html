@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My AI Chat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Animated Aurora Background -->
+  <div class="animated-background" aria-hidden="true">
+    <div class="aurora aurora-one"></div>
+    <div class="aurora aurora-two"></div>
+    <div class="aurora aurora-three"></div>
+    <div class="particle-field"></div>
+  </div>
+
+
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">✦</span>
+      <span>My AI</span>
+    </div>
+
+    <button class="new-chat" id="new-chat">＋ New chat</button>
+
+    <div class="plugins-section">
+      <div class="plugins-heading">
+        <span>PLUGINS</span>
+        <button id="open-plugin-store" title="Explore plugins">＋</button>
+      </div>
+      <div id="active-plugins" class="active-plugins"></div>
+    </div>
+
+
+    <div class="history-heading">RECENT</div>
+    <div id="history" class="history-list"></div>
+
+    <div class="sidebar-bottom">Powered by Groq + RAG</div>
+  </aside>
+
+  <main class="main">
+
+    <header class="topbar">
+      <div class="mobile-brand">✦ My AI</div>
+
+      <div class="model-label">
+        <span class="status-dot"></span>
+        <span id="mode-label">Nova AI</span>
+      </div>
+
+
+    </header>
+
+    <section id="chat-box" class="chat-box" aria-live="polite">
+
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">✦</div>
+
+        <h1>How can I help you today?</h1>
+
+        <p>Ask a question, explore an idea, or get help with a task.</p>
+
+        <div class="suggestions">
+          <button class="suggestion"
+            data-prompt="Explain how large language models work in simple terms.">
+            Explain LLMs simply
+          </button>
+
+          <button class="suggestion"
+            data-prompt="Give me a beginner-friendly Python project idea.">
+            Suggest a Python project
+          </button>
+
+          <button class="suggestion"
+            data-prompt="Help me understand RAG architecture with an example.">
+            Explain RAG architecture
+          </button>
+        </div>
+      </div>
+
+    </section>
+
+    <div class="composer-wrap">
+
+      <div class="selected-document" id="selected-document">
+        No document attached
+      </div>
+
+      <div class="composer">
+        <button id="upload-btn" class="upload-btn" title="Upload document" aria-label="Upload document">＋</button>
+
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt" hidden>
+
+        <textarea id="message" rows="1" placeholder="Message My AI..." aria-label="Your message"></textarea>
+
+        <button id="send-btn" class="send-btn" aria-label="Send message">↑</button>
+      </div>
+
+      <div id="upload-status" class="upload-status"></div>
+
+      <p class="disclaimer">
+        AI can make mistakes. Verify important information.
+      </p>
+
+    </div>
+
+  </main>
+
+
+  <div id="plugin-store-overlay" class="plugin-overlay">
+    <div class="plugin-modal">
+      <div class="plugin-modal-header">
+        <div>
+          <h2>Explore Plugins</h2>
+          <p>Extend your AI assistant with useful tools.</p>
+        </div>
+        <button id="close-plugin-store" class="plugin-close">&times;</button>
+      </div>
+      <div id="plugin-list" class="plugin-list"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+  <script src="auth-ui.js"></script>
+  <script src="script.js"></script>
+
+  <script src="voice.js"></script>
+
+<style>
+.nova-brand-large {
+    font-size: 34px !important;
+    font-weight: 800 !important;
+    letter-spacing: 1px;
+}
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const elements = [...document.querySelectorAll("*")]
+        .filter(el => el.children.length === 0 &&
+            el.textContent.trim().includes("Nova AI"));
+
+    elements.forEach(el => el.classList.add("nova-brand-large"));
+});
+</script>
+\n</body>
+</html>

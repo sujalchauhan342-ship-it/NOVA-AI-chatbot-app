@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+**/.env
+**/.env.*
+*.db
+backend/users.db
+backend/.auth_secret
+backend/uploads/
+backend/chroma_db/
+.DS_Store

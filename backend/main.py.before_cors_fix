@@ -1,0 +1,1543 @@
+import os
+import ast
+import operator
+import json
+from urllib.parse import urlencode
+from urllib.request import urlopen
+import re
+import uuid
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
+from auth import router as auth_router, verify_access_token
+from fastapi.middleware.cors import CORSMiddleware
+from groq import Groq
+from ddgs import DDGS
+from pydantic import BaseModel, Field
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# --------------------------------------------------
+# FASTAPI APPLICATION
+# --------------------------------------------------
+
+app = FastAPI(
+    title="ChatGPT Clone API",
+    description="AI chatbot with document upload and RAG capabilities.",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+app.include_router(auth_router)
+
+PROTECTED_EXACT_PATHS = {
+    "/chat", "/upload", "/documents", "/vector-status"
+}
+
+PROTECTED_PREFIXES = (
+    "/process/", "/chunk/", "/embed/",
+    "/search/", "/chat-with-doc/"
+)
+
+@app.middleware("http")
+async def authentication_middleware(request, call_next):
+    path = request.url.path
+
+    protected = (
+        path in PROTECTED_EXACT_PATHS
+        or path.startswith(PROTECTED_PREFIXES)
+    )
+
+    if protected:
+        authorization = request.headers.get("Authorization", "")
+
+        if not authorization.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Please log in first."}
+            )
+
+        try:
+            verify_access_token(authorization[7:])
+        except HTTPException as error:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": error.detail}
+            )
+
+    return await call_next(request)
+
+
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+# --------------------------------------------------
+# REQUEST MODELS
+# --------------------------------------------------
+
+class HistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20000)
+    history: list[HistoryMessage] = Field(default_factory=list)
+    enabled_plugins: list[str] = Field(default_factory=lambda: ["calculator"])
+
+
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+# CALCULATOR PLUGIN
+# --------------------------------------------------
+
+ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def safe_calculate(expression: str):
+
+    if not expression or len(expression) > 200:
+        raise ValueError("Invalid mathematical expression.")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node):
+
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(
+                node.value, (int, float)
+            ):
+                raise ValueError("Only numbers are allowed.")
+            return node.value
+
+        if isinstance(node, ast.BinOp):
+
+            operation = ALLOWED_OPERATORS.get(type(node.op))
+
+            if operation is None:
+                raise ValueError("Unsupported operation.")
+
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("Exponent is too large.")
+
+            result = operation(left, right)
+
+            if isinstance(result, (int, float)):
+                if abs(result) > 1e100:
+                    raise ValueError("Result is too large.")
+
+            return result
+
+        if isinstance(node, ast.UnaryOp):
+
+            operation = ALLOWED_OPERATORS.get(type(node.op))
+
+            if operation is None:
+                raise ValueError("Unsupported operation.")
+
+            return operation(evaluate(node.operand))
+
+        raise ValueError("Invalid mathematical expression.")
+
+    return evaluate(tree)
+
+
+def calculator_plugin(expression: str):
+
+    try:
+        result = safe_calculate(expression)
+
+        return {
+            "status": "success",
+            "expression": expression,
+            "result": result
+        }
+
+    except Exception as exc:
+
+        return {
+            "status": "error",
+            "message": str(exc)
+        }
+
+
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+# WEATHER PLUGIN
+# --------------------------------------------------
+
+WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow",
+    73: "Moderate snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail"
+}
+
+
+def weather_plugin(location: str, forecast_days: int = 3):
+    """Fetch current weather and a short forecast using Open-Meteo."""
+
+    location = location.strip()
+    forecast_days = max(1, min(int(forecast_days), 3))
+
+    if not location:
+        return {"status": "error", "message": "Please provide a city or location."}
+
+    try:
+        # Find the coordinates for the requested city.
+        geo_params = urlencode({
+            "name": location,
+            "count": 1,
+            "language": "en",
+            "format": "json"
+        })
+        geo_url = "https://geocoding-api.open-meteo.com/v1/search?" + geo_params
+
+        with urlopen(geo_url, timeout=12) as response:
+            geo_data = json.loads(response.read().decode("utf-8"))
+
+        places = geo_data.get("results", [])
+        if not places:
+            return {
+                "status": "error",
+                "message": f"Location '{location}' was not found. Try a nearby city name."
+            }
+
+        place = places[0]
+        latitude = place["latitude"]
+        longitude = place["longitude"]
+
+        # Fetch current conditions and daily forecast.
+        forecast_params = urlencode({
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": (
+                "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                "precipitation,weather_code,wind_speed_10m"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max"
+            ),
+            "forecast_days": forecast_days,
+            "timezone": "auto"
+        })
+        forecast_url = "https://api.open-meteo.com/v1/forecast?" + forecast_params
+
+        with urlopen(forecast_url, timeout=12) as response:
+            weather_data = json.loads(response.read().decode("utf-8"))
+
+        current = weather_data.get("current", {})
+        daily = weather_data.get("daily", {})
+
+        code = current.get("weather_code")
+        current_weather = {
+            "temperature_c": current.get("temperature_2m"),
+            "feels_like_c": current.get("apparent_temperature"),
+            "humidity_percent": current.get("relative_humidity_2m"),
+            "wind_speed_kmh": current.get("wind_speed_10m"),
+            "precipitation_mm": current.get("precipitation"),
+            "condition": WEATHER_CODES.get(code, "Unknown")
+        }
+
+        forecast = []
+        dates = daily.get("time", [])
+
+        for index, date in enumerate(dates):
+            daily_code = daily.get("weather_code", [None] * len(dates))[index]
+            forecast.append({
+                "date": date,
+                "condition": WEATHER_CODES.get(daily_code, "Unknown"),
+                "temperature_max_c": daily.get("temperature_2m_max", [None] * len(dates))[index],
+                "temperature_min_c": daily.get("temperature_2m_min", [None] * len(dates))[index],
+                "rain_probability_percent": daily.get(
+                    "precipitation_probability_max", [None] * len(dates)
+                )[index]
+            })
+
+        return {
+            "status": "success",
+            "location": {
+                "name": place.get("name"),
+                "admin1": place.get("admin1"),
+                "country": place.get("country")
+            },
+            "timezone": weather_data.get("timezone"),
+            "current": current_weather,
+            "forecast": forecast
+        }
+
+    except Exception as exc:
+        print(f"Weather plugin error: {exc}")
+        return {
+            "status": "error",
+            "message": "Weather service is temporarily unavailable. Please try again."
+        }
+
+
+
+# --------------------------------------------------
+# WEB SEARCH PLUGIN
+# --------------------------------------------------
+
+def web_search_plugin(query: str, max_results: int = 5):
+    try:
+        query = query.strip()
+
+        if not query:
+            return {
+                "status": "error",
+                "message": "Search query cannot be empty."
+            }
+
+        max_results = max(1, min(int(max_results), 8))
+
+        with DDGS(timeout=10) as ddgs:
+            results = ddgs.text(
+                query,
+                region="in-en",
+                safesearch="moderate",
+                max_results=max_results
+            )
+
+        formatted_results = []
+
+        for result in results or []:
+            formatted_results.append({
+                "title": result.get("title", ""),
+                "url": result.get("href", ""),
+                "snippet": result.get("body", "")
+            })
+
+        if not formatted_results:
+            return {
+                "status": "success",
+                "query": query,
+                "results": [],
+                "message": "No search results found."
+            }
+
+        return {
+            "status": "success",
+            "query": query,
+            "results": formatted_results
+        }
+
+    except Exception as e:
+        print(f"Web Search Error: {e}")
+        return {
+            "status": "error",
+            "message": "Web search is temporarily unavailable."
+        }
+
+
+
+# --------------------------------------------------
+# WIKIPEDIA PLUGIN
+# --------------------------------------------------
+
+def wikipedia_plugin(query: str, max_results: int = 5):
+    try:
+        query = query.strip()
+
+        if not query:
+            return {
+                "status": "error",
+                "message": "Wikipedia search query cannot be empty."
+            }
+
+        max_results = max(1, min(int(max_results), 8))
+
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrlimit": max_results,
+            "prop": "extracts",
+            "exintro": 1,
+            "explaintext": 1,
+            "exsentences": 5,
+            "inprop": "url",
+            "format": "json",
+            "formatversion": 2
+        }
+
+        url = (
+            "https://en.wikipedia.org/w/api.php?"
+            + urlencode(params)
+        )
+
+        with urlopen(url, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        pages = data.get("query", {}).get("pages", [])
+
+        results = []
+
+        for page in pages:
+            results.append({
+                "title": page.get("title", ""),
+                "url": page.get("fullurl", ""),
+                "extract": page.get("extract", "")
+            })
+
+        return {
+            "status": "success",
+            "query": query,
+            "results": results,
+            "message": (
+                "Wikipedia articles retrieved successfully."
+                if results else "No Wikipedia articles found."
+            )
+        }
+
+    except Exception as e:
+        print(f"Wikipedia Plugin Error: {e}")
+
+        return {
+            "status": "error",
+            "message": "Wikipedia service is temporarily unavailable."
+        }
+
+
+# PLUGIN TOOL DEFINITIONS
+# --------------------------------------------------
+
+AVAILABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": (
+                "Perform mathematical calculations. "
+                "Use this tool whenever calculations, percentages or arithmetic are required."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Mathematical expression. Example: 800 * 25 / 100"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": (
+                "Get current weather and a forecast for a city or location. "
+                "Use this for questions about current weather, temperature, rain, "
+                "humidity, wind, or upcoming weather."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or location name, for example Delhi or Mumbai."
+                    },
+                    "forecast_days": {
+                        "type": "integer",
+                        "description": "Number of forecast days, from 1 to 3.",
+                        "minimum": 1,
+                        "maximum": 3
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the internet for current information, recent news, "
+                "web pages, facts, and online information. "
+                "Use this tool when the user asks for online or latest information."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of search results, between 1 and 8.",
+                        "minimum": 1,
+                        "maximum": 8
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+,
+    {
+        "type": "function",
+        "function": {
+            "name": "wikipedia",
+            "description": (
+                "Search Wikipedia articles for general knowledge, "
+                "science, technology, history, famous people, education, "
+                "geography and other informational topics."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Topic or question to search on Wikipedia."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of articles to retrieve.",
+                        "minimum": 1,
+                        "maximum": 8
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+
+]
+
+
+# BASIC ENDPOINTS
+# --------------------------------------------------
+
+@app.get("/")
+def home():
+    return {
+        "status": "success",
+        "message": "ChatGPT Clone Backend is Running",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "api_configured": client is not None,
+        "model": GROQ_MODEL,
+    }
+
+
+# --------------------------------------------------
+# --------------------------------------------------
+# CHAT ENDPOINT WITH PLUGIN SUPPORT
+# --------------------------------------------------
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Groq API key is not configured."
+        )
+
+    enabled_plugins = set(request.enabled_plugins or [])
+
+    # Only expose tools that the user has enabled.
+    enabled_tools = [
+        tool for tool in AVAILABLE_TOOLS
+        if tool["function"]["name"] in enabled_plugins
+    ]
+
+    system_prompt = (
+        "You are a helpful AI assistant. "
+        "Give clear, accurate answers in English. "
+    )
+
+    if "calculator" in enabled_plugins:
+        system_prompt += (
+            "Use the calculator tool whenever mathematical calculations "
+            "are required. Never guess calculation results. "
+        )
+
+    if "weather" in enabled_plugins:
+        system_prompt += (
+            "Use the weather tool for current weather and forecast questions. "
+            "Do not invent live weather information. "
+        )
+
+
+    if "web_search" in enabled_plugins:
+        system_prompt += (
+            "Use the web_search tool when the user asks for current information, "
+            "latest news, recent events, or information that requires internet search. "
+            "Base your answer on the returned search results. Include source URLs "
+            "when relevant. Never invent search results. "
+        )
+
+    if "wikipedia" in enabled_plugins:
+        system_prompt += (
+            "Use the wikipedia tool for general knowledge and educational "
+            "questions when Wikipedia information is appropriate. "
+            "Base your answer on retrieved articles and include article "
+            "titles or URLs when relevant. Never invent article content. "
+        )
+
+    if not enabled_tools:
+        system_prompt += "No plugins are enabled. Do not call any plugin tools."
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        }
+    ]
+
+    for item in request.history[-10:]:
+        messages.append({
+            "role": item.role,
+            "content": item.content
+        })
+
+    messages.append({
+        "role": "user",
+        "content": request.message
+    })
+
+    used_plugins = []
+
+    try:
+
+        result = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            **({"tools": enabled_tools, "tool_choice": "auto"} if enabled_tools else {}),
+            temperature=0.2,
+            max_tokens=2048
+        )
+
+        for _ in range(5):
+
+            assistant_message = result.choices[0].message
+            tool_calls = assistant_message.tool_calls
+
+            if not tool_calls:
+                return {
+                    "status": "success",
+                    "response": assistant_message.content or "",
+                    "plugin_used": bool(used_plugins),
+                    "plugins": used_plugins
+                }
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content or "",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments
+                        }
+                    }
+                    for call in tool_calls
+                ]
+            })
+
+            for call in tool_calls:
+
+                function_name = call.function.name
+
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+
+                    if function_name not in enabled_plugins:
+                        tool_result = {
+                            "status": "error",
+                            "message": f"The {function_name} plugin is disabled."
+                        }
+
+                    elif function_name == "calculator":
+                        tool_result = calculator_plugin(arguments["expression"])
+
+                    elif function_name == "weather":
+                        tool_result = weather_plugin(
+                            arguments["location"],
+                            arguments.get("forecast_days", 3)
+                        )
+
+                    elif function_name == "web_search":
+                        tool_result = web_search_plugin(
+                            arguments["query"],
+                            arguments.get("max_results", 5)
+                        )
+
+                    elif function_name == "wikipedia":
+                        tool_result = wikipedia_plugin(
+                            arguments["query"],
+                            arguments.get("max_results", 5)
+                        )
+
+                    else:
+                        tool_result = {
+                            "status": "error",
+                            "message": "Unknown plugin."
+                        }
+
+                    if (
+                        function_name in ("calculator", "weather", "web_search", "wikipedia")
+                        and tool_result.get("status") == "success"
+                        and function_name not in used_plugins
+                    ):
+                        used_plugins.append(function_name)
+
+                except Exception as exc:
+                    print(f"Plugin execution error ({function_name}): {exc}")
+                    tool_result = {
+                        "status": "error",
+                        "message": "The plugin could not process this request."
+                    }
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(tool_result)
+                })
+
+            # Keep the same enabled-plugin restrictions in every tool round.
+            result = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                **({"tools": enabled_tools, "tool_choice": "auto"} if enabled_tools else {}),
+                temperature=0.2,
+                max_tokens=2048
+            )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Maximum plugin execution rounds exceeded."
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        print(f"Chat/Plugin error: {exc}")
+
+        raise HTTPException(
+            status_code=502,
+            detail="The AI provider or plugin could not complete the request."
+        ) from exc
+
+
+# DOCUMENT UPLOAD ENDPOINT
+# --------------------------------------------------
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+
+    original_name = Path(file.filename or "").name
+
+    if not original_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a valid filename.",
+        )
+
+    extension = Path(original_name).suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, DOCX and TXT files are supported.",
+        )
+
+    safe_name = re.sub(
+        r"[^a-zA-Z0-9._-]",
+        "_",
+        original_name,
+    )
+
+    document_id = uuid.uuid4().hex
+
+    stored_name = f"{document_id}_{safe_name}"
+    destination = UPLOAD_DIR / stored_name
+
+    total_size = 0
+
+    try:
+        with destination.open("wb") as output:
+
+            while True:
+
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File size cannot exceed 20 MB.",
+                    )
+
+                output.write(chunk)
+
+        if total_size == 0:
+            destination.unlink(missing_ok=True)
+
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        return {
+            "status": "success",
+            "message": "Document uploaded successfully.",
+            "document_id": document_id,
+            "filename": original_name,
+            "size_bytes": total_size,
+        }
+
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        print(f"Upload error: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the uploaded document.",
+        ) from exc
+
+    finally:
+        await file.close()
+
+
+# --------------------------------------------------
+# LIST UPLOADED DOCUMENTS
+# --------------------------------------------------
+
+@app.get("/documents")
+def get_documents():
+
+    documents = []
+
+    for path in UPLOAD_DIR.iterdir():
+
+        if not path.is_file():
+            continue
+
+        if "_" not in path.name:
+            continue
+
+        document_id, filename = path.name.split("_", 1)
+
+        documents.append({
+            "document_id": document_id,
+            "filename": filename,
+            "size_bytes": path.stat().st_size,
+        })
+
+    return {
+        "status": "success",
+        "total_documents": len(documents),
+        "documents": documents,
+    }
+
+
+# --------------------------------------------------
+# DOCUMENT TEXT EXTRACTION
+# --------------------------------------------------
+
+import fitz
+from docx import Document
+
+
+def extract_text(file_path: Path, extension: str):
+    extracted_pages = []
+
+    if extension == ".pdf":
+        with fitz.open(file_path) as pdf:
+            for page_number, page in enumerate(pdf, start=1):
+                text = page.get_text("text").strip()
+
+                if text:
+                    extracted_pages.append({
+                        "page": page_number,
+                        "text": text
+                    })
+
+    elif extension == ".docx":
+        document = Document(str(file_path))
+
+        text = "\
+".join(
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+        )
+
+        if text:
+            extracted_pages.append({
+                "page": None,
+                "text": text
+            })
+
+    elif extension == ".txt":
+        text = file_path.read_text(
+            encoding="utf-8",
+            errors="replace"
+        ).strip()
+
+        if text:
+            extracted_pages.append({
+                "page": None,
+                "text": text
+            })
+
+    return extracted_pages
+
+
+# --------------------------------------------------
+# PROCESS DOCUMENT API
+# --------------------------------------------------
+
+@app.post("/process/{document_id}")
+def process_document(document_id: str):
+
+    if not document_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID."
+        )
+
+    matching_files = [
+        file for file in UPLOAD_DIR.iterdir()
+        if file.is_file() and file.name.startswith(document_id + "_")
+    ]
+
+    if not matching_files:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found."
+        )
+
+    file_path = matching_files[0]
+    extension = file_path.suffix.lower()
+
+    try:
+        pages = extract_text(file_path, extension)
+
+        full_text = "\
+\
+".join(
+            item["text"] for item in pages
+        )
+
+        if not full_text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text found in the document."
+            )
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "filename": file_path.name.split("_", 1)[1],
+            "total_pages": len(pages) if extension == ".pdf" else None,
+            "total_characters": len(full_text),
+            "extracted_text": pages
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Document extraction error: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not extract document text."
+        ) from exc
+
+
+# --------------------------------------------------
+# TEXT CHUNKING
+# --------------------------------------------------
+
+def create_chunks(text: str, chunk_size: int = 500, overlap: int = 100):
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("Invalid chunk size or overlap.")
+
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for word in words:
+        added_length = len(word) + (1 if current_chunk else 0)
+
+        if current_length + added_length > chunk_size and current_chunk:
+            chunk_text = " ".join(current_chunk)
+
+            if len(chunk_text) >= 50:
+                chunks.append(chunk_text)
+
+            overlap_words = []
+            overlap_length = 0
+
+            for previous_word in reversed(current_chunk):
+                extra = len(previous_word) + (1 if overlap_words else 0)
+
+                if overlap_length + extra > overlap:
+                    break
+
+                overlap_words.insert(0, previous_word)
+                overlap_length += extra
+
+            current_chunk = overlap_words
+            current_length = len(" ".join(current_chunk))
+
+        current_chunk.append(word)
+        current_length += len(word) + (1 if len(current_chunk) > 1 else 0)
+
+    if current_chunk:
+        final_chunk = " ".join(current_chunk)
+        if len(final_chunk) >= 50:
+            chunks.append(final_chunk)
+
+    return chunks
+
+
+# --------------------------------------------------
+# CHUNK DOCUMENT API
+# --------------------------------------------------
+
+@app.post("/chunk/{document_id}")
+def chunk_document(document_id: str):
+
+    if not document_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID."
+        )
+
+    matching_files = [
+        file for file in UPLOAD_DIR.iterdir()
+        if file.is_file() and file.name.startswith(document_id + "_")
+    ]
+
+    if not matching_files:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found."
+        )
+
+    file_path = matching_files[0]
+
+    try:
+        pages = extract_text(file_path, file_path.suffix.lower())
+
+        all_chunks = []
+
+        for page in pages:
+            page_chunks = create_chunks(page["text"])
+
+            for index, chunk in enumerate(page_chunks, start=1):
+                all_chunks.append({
+                    "chunk_id": len(all_chunks) + 1,
+                    "page": page["page"],
+                    "text": chunk
+                })
+
+        if not all_chunks:
+            raise HTTPException(
+                status_code=422,
+                detail="No chunks could be generated from this document."
+            )
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "filename": file_path.name.split("_", 1)[1],
+            "total_chunks": len(all_chunks),
+            "chunk_size": 500,
+            "chunk_overlap": 100,
+            "chunks": all_chunks
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Chunking error: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create document chunks."
+        ) from exc
+
+
+# --------------------------------------------------
+# EMBEDDINGS AND CHROMADB
+# --------------------------------------------------
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+CHROMA_DIR = Path(__file__).resolve().parent / "chroma_db"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+_embedding_model = None
+_chroma_client = None
+_chroma_collection = None
+
+
+def get_embedding_resources():
+    global _embedding_model
+    global _chroma_client
+    global _chroma_collection
+
+    if _embedding_model is None:
+        print("Loading embedding model...")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    if _chroma_client is None:
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+        _chroma_client = chromadb.PersistentClient(
+            path=str(CHROMA_DIR)
+        )
+
+        _chroma_collection = _chroma_client.get_or_create_collection(
+            name="document_chunks",
+            metadata={"hnsw:space": "cosine"}
+        )
+
+    return _embedding_model, _chroma_collection
+
+
+# --------------------------------------------------
+# GENERATE AND STORE DOCUMENT EMBEDDINGS
+# --------------------------------------------------
+
+@app.post("/embed/{document_id}")
+def embed_document(document_id: str):
+
+    if not document_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID."
+        )
+
+    matching_files = [
+        file for file in UPLOAD_DIR.iterdir()
+        if file.is_file() and file.name.startswith(document_id + "_")
+    ]
+
+    if not matching_files:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found."
+        )
+
+    file_path = matching_files[0]
+
+    try:
+        # Extract document text
+        pages = extract_text(file_path, file_path.suffix.lower())
+
+        # Generate chunks
+        all_chunks = []
+
+        for page in pages:
+            page_chunks = create_chunks(page["text"])
+
+            for chunk in page_chunks:
+                all_chunks.append({
+                    "text": chunk,
+                    "page": page["page"]
+                })
+
+        if not all_chunks:
+            raise HTTPException(
+                status_code=422,
+                detail="No chunks found in the document."
+            )
+
+        # Load embedding model and ChromaDB
+        model, collection = get_embedding_resources()
+
+        # Generate vectors
+        texts = [chunk["text"] for chunk in all_chunks]
+
+        embeddings = model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False
+        )
+
+        # Remove previous embeddings for this document
+        collection.delete(
+            where={"document_id": document_id}
+        )
+
+        # Prepare metadata
+        ids = []
+        metadatas = []
+
+        for index, chunk in enumerate(all_chunks, start=1):
+            ids.append(f"{document_id}_chunk_{index}")
+
+            metadatas.append({
+                "document_id": document_id,
+                "filename": file_path.name.split("_", 1)[1],
+                "chunk_id": index,
+                "page": chunk["page"] or 0
+            })
+
+        # Store vectors and text in ChromaDB
+        collection.add(
+            ids=ids,
+            embeddings=embeddings.tolist(),
+            documents=texts,
+            metadatas=metadatas
+        )
+
+        return {
+            "status": "success",
+            "message": "Embeddings generated and stored successfully.",
+            "document_id": document_id,
+            "filename": file_path.name.split("_", 1)[1],
+            "total_chunks": len(all_chunks),
+            "embedding_dimensions": len(embeddings[0]),
+            "vector_database": "ChromaDB"
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Embedding error: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not generate or store embeddings."
+        ) from exc
+
+
+# --------------------------------------------------
+# CHROMADB STATUS API
+# --------------------------------------------------
+
+@app.get("/vector-status")
+def vector_status():
+
+    try:
+        _, collection = get_embedding_resources()
+
+        return {
+            "status": "success",
+            "collection": collection.name,
+            "total_vectors": collection.count(),
+            "storage": str(CHROMA_DIR)
+        }
+
+    except Exception as exc:
+        print(f"ChromaDB error: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not access ChromaDB."
+        ) from exc
+
+
+# --------------------------------------------------
+# SEMANTIC SEARCH API
+# --------------------------------------------------
+
+class SearchRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=2000)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@app.post("/search/{document_id}")
+def search_document(document_id: str, request: SearchRequest):
+
+    if not document_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID."
+        )
+
+    try:
+        model, collection = get_embedding_resources()
+
+        if collection.count() == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No document embeddings found. Process the document first."
+            )
+
+        # Convert the user's question into a vector
+        question_embedding = model.encode(
+            request.question,
+            normalize_embeddings=True
+        ).tolist()
+
+        # Search only inside the selected document
+        results = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=min(request.top_k, collection.count()),
+            where={"document_id": document_id},
+            include=["documents", "metadatas", "distances"]
+        )
+
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        if not documents:
+            raise HTTPException(
+                status_code=404,
+                detail="No embeddings found for this document. Generate embeddings first."
+            )
+
+        matches = []
+
+        for text, metadata, distance in zip(
+            documents, metadatas, distances
+        ):
+            similarity = max(0.0, min(1.0, 1.0 - distance))
+
+            matches.append({
+                "chunk_id": metadata["chunk_id"],
+                "filename": metadata["filename"],
+                "page": metadata["page"] or None,
+                "similarity": round(similarity, 4),
+                "text": text
+            })
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "question": request.question,
+            "total_results": len(matches),
+            "results": matches
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Semantic search error: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Semantic search failed. Check the backend terminal."
+        ) from exc
+
+
+# --------------------------------------------------
+# RAG CHAT API - GROQ + CHROMADB
+# --------------------------------------------------
+
+class RAGChatRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=10000)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@app.post("/chat-with-doc/{document_id}")
+def chat_with_document(document_id: str, request: RAGChatRequest):
+
+    if not document_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID."
+        )
+
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Groq API key is not configured."
+        )
+
+    try:
+        # 1. Load embedding model and ChromaDB
+        model, collection = get_embedding_resources()
+
+        # 2. Convert question into an embedding
+        question_embedding = model.encode(
+            request.question,
+            normalize_embeddings=True
+        ).tolist()
+
+        # 3. Retrieve relevant chunks from the selected document
+        results = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=request.top_k,
+            where={"document_id": document_id},
+            include=["documents", "metadatas", "distances"]
+        )
+
+        retrieved_texts = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+
+        if not retrieved_texts:
+            raise HTTPException(
+                status_code=404,
+                detail="No document chunks found. Generate embeddings first."
+            )
+
+        # 4. Build context with source information
+        context_parts = []
+        sources = []
+
+        for text, metadata in zip(retrieved_texts, metadatas):
+            page = metadata.get("page", 0)
+
+            source = {
+                "filename": metadata.get("filename"),
+                "page": page or None,
+                "chunk_id": metadata.get("chunk_id")
+            }
+
+            context_parts.append(
+                f"Source: {source['filename']}, "
+                f"Page: {source['page']}, "
+                f"Chunk: {source['chunk_id']}\n{text}"
+            )
+
+            sources.append(source)
+
+        context = "\n\n".join(context_parts)
+
+        # 5. Send retrieved context and question to Groq
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a document-based AI assistant. "
+                    "Answer the user's question using the supplied document "
+                    "context. Do not invent facts or use outside knowledge "
+                    "to fill gaps. If the answer is not present in the "
+                    "context, clearly say that the uploaded document does "
+                    "not provide enough information. "
+                    "When possible, mention the relevant page number."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"DOCUMENT CONTEXT:\n{context}\n\n"
+                    f"USER QUESTION:\n{request.question}\n\n"
+                    "Answer clearly using the document context."
+                )
+            }
+        ]
+
+        result = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2048
+        )
+
+        answer = result.choices[0].message.content or ""
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "question": request.question,
+            "answer": answer,
+            "sources": sources,
+            "model": GROQ_MODEL
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"RAG chat error: {exc}")
+
+        raise HTTPException(
+            status_code=502,
+            detail="RAG chat failed. Check the backend terminal."
+        ) from exc

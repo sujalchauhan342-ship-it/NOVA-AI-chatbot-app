@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+groq
+python-dotenv
+chromadb
+sentence-transformers
+pymupdf
+python-docx
+python-multipart
+ddgs>=9.0.0
